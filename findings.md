@@ -1,6 +1,69 @@
 # Zero-Day Vulnerability Discovery — Apple `container`
 
-Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `apple/containerization@0.40.1` cloned to `deps/containerization`.
+Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `apple/containerization@0.40.1` cloned to `deps/containerization`. Also audited deps-of-deps: grpc-swift-2, grpc-swift-nio-transport, swift-nio-http2, swift-nio, swift-toml, Yams.
+
+Method: first-principles code analysis (no changelog/CVE diffing), ~14 subagents across a diverse portfolio (input parsing, archive/EXT4, DNS, XPC authz, registry/OCI, guest→host escape, builder, deserialization, TCP forwarding, concurrency, gRPC transport), each concrete finding independently re-verified by an adversarial agent and/or the root agent. Full working registry is below the report.
+
+---
+
+# ═══════════ CONSOLIDATED FINDINGS (FINAL REPORT) ═══════════
+
+## Architecture & where escalation can/can't come from
+Everything runs in the **per-user launchd domain** (`gui/<uid>`); **no root daemon**. XPC authorization is `audit_token_to_euid(client) == geteuid()` only (`XPCServer.swift:176-193`), so same-EUID XPC is not a privilege boundary. Real escalation therefore lives at three boundaries: **(1) untrusted registry/image → host**, **(2) guest container → host**, **(3) remote/LAN network → host**. The two classic container-escape channels — the guest→host copy-out tar extractor and the guest→host gRPC/HTTP2 transport — were both audited in depth and found **hardened** (see "What is hardened").
+
+## Ranked findings
+
+### HIGH
+
+**H1 — Digest-pinned image pulls are never verified against the pin (supply-chain integrity bypass).** Boundary: registry/network→host. *Double-confirmed (root + adversarial skeptic).*
+`ImageStore.pull` (`deps/containerization/.../ImageStore/ImageStore.swift:242-248`) resolves `image@sha256:AAAA` via a HEAD and takes the content digest from the registry's `Docker-Content-Digest` **response header** (`RegistryClient+Fetch.swift:57,73`), **never comparing it to the pinned `AAAA`**. Downstream fetches then verify bytes against that header digest (`BBBB`), making the chain self-consistent with attacker content. A malicious/compromised registry or pull-through mirror serves a backdoored image under a different digest and echoes it — the pin is a **no-op**. Blast radius: `container pull`, `container run`, and `FROM …@sha256:` base images in builds (`BuildImageResolver.swift:90,93`). Two exploitation tiers: **(a) malicious registry over HTTPS = unconditional**; **(b) LAN MITM with no registry compromise, by default**, because the default scheme is `auto` (`Flags.swift:162`) which downgrades `localhost`, `.<internalDnsDomain>`, and private-CIDR (10/8, 127/8, 192.168/16, 172.16/12) registries to **plaintext HTTP** (`RequestScheme.swift:46-96`) — i.e. exactly the common self-hosted/corporate registry ranges. Fix: after resolve, `guard ref.digest == nil || rootDescriptor.digest == ref.digest`.
+
+**H2 — EXT4 short-read → out-of-bounds heap read (guest→host info-disclosure/crash).** Boundary: guest→host. *Confirmed (adversarial verifier + root, incl. stdlib semantics).*
+`EXT4Reader` reads fixed-size on-disk structs directly from a `FileHandle.read(upToCount:)` buffer with no length check (`deps/containerization/.../ContainerizationEXT4/EXT4+Reader.swift:56-61` superblock, `:123-129` group desc, `:141-146` inode). `loadLittleEndian` (`UnsafeLittleEndianBytes.swift:52-57`) calls `UnsafeRawBufferPointer.load`, whose bounds check is `_debugPrecondition` — **elided under `-O`** (the shipped release config; no `-Ounchecked`). A malicious container (root in guest) tampers its own rootfs ext4 metadata so an attacker-steered offset (`inodeTableLow*blockSize + n*inodeSize`) makes the read land mid-struct at EOF → `baseAddress!.load(sizeof(T))` reads past the heap buffer. Honest caveats: **read-only** (not write), **release-build only** (debug traps), and reached via **`container export`** of a stopped container (operator-action; verifier refuted any zero-click auto-parse — `exportRootfs`, `ContainersService.swift:911`, is the only reader). Fix: `guard data.count >= MemoryLayout<T>.size` before each load; validate superblock invariants.
+
+**H3 — `--publish` binds `0.0.0.0` by default while docs promise loopback (LAN exposure).** Boundary: remote LAN. *Confirmed (root + agent).*
+`Parser.swift:649` defaults an unspecified `-p HOST:GUEST` host address to `0.0.0.0` (bind at `TCPForwarder.swift:66`), but `docs/how-to.md:155` ("forward … from your loopback IP"), all 127.0.0.1 examples, `LocalNetworkPrivacy.swift:24-25`, and `start-here.md:149` ("external systems have no access") frame publishing as loopback-only. Users unknowingly expose guest dev-servers/DBs to unauthenticated LAN peers. Fix: default `127.0.0.1`, require explicit `0.0.0.0`.
+
+**H4 — Exponential pull-graph expansion → daemon OOM/hang (remote DoS).** Boundary: registry→host. *Confirmed by inspection.*
+`ImageStore.ImportOperation.getSupportedPlatforms` (`deps/containerization/.../ImageStore+Import.swift:230-254`) walks manifest descriptors with `toProcess = children` (line 251) with **no dedup/visited-set/depth cap**, unlike its sibling `import` loop which dedups (line 63). A malicious registry serves nested indexes with N repeated children (mediaType attacker-set; `walk` recurses; `filterPlatforms` keeps platform-less index descriptors) → N·N²·N³ `Descriptor`s from a ~MB payload → tens of GB → OOM. Fix: visited-set + depth cap (mirror the `import` dedup).
+
+### MEDIUM
+
+**M1 — Unvalidated OCI digest → content-store path traversal (central, multi-path).** *Triple-confirmed (A/F/B) + root.* Registry-supplied `Descriptor.digest` (`sha256:../../…`, unvalidated `String`, `Descriptor.swift:29`) flows to `LocalContentStore.get` `appendingPathComponent(trimmingDigestPrefix)` (`LocalContentStore.swift:59-61`) with no `..`/hex check → daemon opens+JSON-parses arbitrary host files on `pull`/`load`/build (`BuildRemoteContentProxy.swift:66,82`); `delete(digests:)` (`:103-121`) uses the **raw** string → same-EUID arbitrary file delete via `contentDelete`. Registry-triggered write/commit is blocked (source==dest collision + re-verify). Fix centrally: validate `sha256:[0-9a-f]{64}` at decode + before any path use.
+
+**M2 — Malicious image crashes host EXT4 unpack on plain `pull`/`run`/`build` (DoS).** *Confirmed (C+B+verifier).* Path component >255 UTF-8 bytes → `UInt8(nameData.count)` trap (`EXT4+Formatter.swift:1286`); very deep path → unbounded `create` recursion → stack overflow (`:386`). Fully wired from `ImagePull`→`EXT4Unpacker`→`writeDirEntry`, no operator action. (Export-path read traps C1/C4/C5 are the operator-action twin.) Fix: reject components >255 bytes; iterate `create`.
+
+**M3 — Registry credentials exposed over plaintext-by-default + to unvalidated auth realm.** *Root-verified.* `RegistryClient.request` (`RegistryClient.swift:159-168`) attaches `Authorization: Basic base64(user:pass)` **preemptively to every request** including the token request to the attacker-controlled `WWW-Authenticate` realm (`RegistryClient+Token.swift:138-158`, no HTTPS/host check). With plaintext-by-default for private registries (H1(b)), a LAN on-path attacker passively harvests stored credentials. Fix: require HTTPS realms + host allowlist; don't send Basic preemptively over plaintext.
+
+**M4 — Guest→host copy-out CPU-spin DoS.** *Confirmed (agent E).* On `container cp`, a compromised guest sets `metadata.isArchive` and streams bytes that put libarchive in `ARCHIVE_FATAL`; `ArchiveReader.StreamingIterator.next()` (`ArchiveReader.swift:221-229`) only breaks on `ARCHIVE_EOF`, so `extractContents` loops forever at 100% CPU on the serial copyQueue. Fix: stop on any result ≠ `ARCHIVE_OK`/`WARN`.
+
+**M5 — TCP forwarder closes the wrong channel on connect race → remote fd leak.** *Confirmed (agent).* `ConnectHandler.swift:62-67` closes `context.channel` (frontend) instead of the connected backend `channel` (log string proves intent) → orphaned guest-bound connections leak fds toward `RLIMIT_NOFILE`. One-line fix: `channel.close(promise: nil)`.
+
+**M6 — Same-EUID daemon crashes via trapping integer conversions.** *Confirmed (agent A).* `containerResize` `UInt16(width/height)` (`ContainersHarness.swift:147`), `containerDial` `UInt32(port)` (`:94`), `containerCopyIn` `UInt32(fileMode)` (`:333`), `volumeCreate` `UInt64(Double)` size (`VolumesService.swift:241,285`) — an out-of-range XPC field aborts the daemon (management-plane DoS). Fix: `UInt16(exactly:)`/range-validate.
+
+**M7 — Registry DoS: manifest self-cycle infinite pull loop (`ImageStore+Import.swift:45-64`); decompression bomb, no uncompressed-size cap (`ArchiveReader.decompressZstd`, `EXT4Unpacker`).**
+
+### LOW / INFORMATIONAL (selected)
+EXT4 export-path traps C1 (div-by-zero `inodesPerGroup==0`), C4/C5 (`subdata` over-reads); CLI stdio double-close (`XPCMessage.swift:242-248`); guest-triggerable host fd-leak (unconsumed vsock accepts); **published-port 64-cap enforced client-side only** (server re-checks only overlaps — same-EUID limit bypass); `WWW-Authenticate`/`WrappedChannel` footguns; **K1** ICU `$`-anchoring lets a trailing-newline id pass `nameValid`/`NetworkResource.nameValid` (chain-link, no high-value sink found); ReDoS via client label-filter regex; Globber `**` symlink-cycle recursion (client-side build DoS); unsigned-package fallback in `update-container.sh`.
+
+## What is hardened (verified negative results — bounds the search)
+- **Copy-out / layer tar extraction on the host**: `ArchiveReader.extractContents` + `FileDescriptorOps` (openat/`O_NOFOLLOW` per component, `..` rejected, symlink-at-intermediate unlinked→real-dir, `O_CREAT|O_EXCL|O_NOFOLLOW` final, perms `&0o777`). Tar-slip/symlink-swap/setuid all defeated.
+- **Guest→host gRPC/HTTP2 transport**: every guest-controlled length bounded (4 MiB msg, 16 KiB frame/header, CONTINUATION ≤5, HPACK overflow-hardened, compression disabled); NIO `readSlice`/`readInteger` nil-safe. No OOB/escape.
+- **DNS wire parser**: 512-byte cap, bounded compression pointers (≤10 hops, strictly backward), no force-unwrap on parse path. Only a latent unreachable `questions[0]`.
+- **Daemon concurrency/fd-lifecycle**: AsyncLock-guarded lifecycle, idempotent relay/listener teardown, atomic allocators (no double-hand-out). No daemon UAF/double-free.
+- **Deserialization/mass-assignment**: no YAML/plist decode surface; OCI `ImageConfig` Codable is narrow (no rootfs/mounts/privileged/caps/host-path); registry JSON capped 4 MiB; swift-toml decode is trusted-only.
+- **Registry content-addressing** (non-pin): layers/config/manifests re-hashed before commit; no foreign-layer `urls` SSRF; push verifies returned digest.
+- **Netlink** (kernel-sourced, not guest), **cross-container network/IP allocation** (same-user), **virtiofs/kernel mount host paths** (user-config, not image/guest): not attacker-privilege-crossing.
+
+## Top fixes (highest leverage)
+1. H1: compare resolved digest to the pinned digest (one guard).
+2. M1: validate `Descriptor.digest` format centrally in `LocalContentStore`.
+3. H2/M2/C-cluster: length-guard every disk-sourced `load`; reject name>255 & cap `create` depth; validate superblock.
+4. H3: default publish bind to loopback.
+5. H4/M7: dedup+depth-cap the pull graph; cap uncompressed layer size.
+
+---
+
 
 ## Trust boundaries / threat model
 - **Host user → apiserver (XPC)**: `XPCServer.handleMessage` authorizes solely by `audit_token_to_euid(token) == geteuid()`. Any process with the daemon's EUID is authorized. Real escalation must come from what handlers *do* (helper tools, root components, path handling).
@@ -126,8 +189,12 @@ Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `app
 
 - **[gRPC/HTTP2 transport agent] — HARDENED, escape route CLOSED.** Host gRPC-client receive path from guest fully bounded: msg cap 4 MiB (`WrappedChannel.swift:312/325` → `GRPCMessageDecoder.swift:64` before `readSlice`), frame 16 KiB (`HTTP2FrameParser.swift:91`), header-list 16 KiB, CONTINUATION ≤5 (CVE-2024-27316 class mitigated, `:663`), HPACK varint overflow-hardened (`IntegerCoding.swift:115-131`), HPACK string len ≤ readableBytes (`HPACKDecoder.swift:291-293`), compression DISABLED (`enabledAlgorithms:.none`) + inflate capped 4 MiB. NIO `readSlice`/`readInteger` nil-safe (no OOB). containerization glue (`Vminitd.swift:36-56`) has no custom length-prefix handling; copy/stdio data-plane uses fixed host chunkSize, guest `totalSize` never drives alloc. **No memory-corruption escape.** Informational: `WrappedChannel` ignores `maxResponseMessageBytes` (uses request cap); container relies on lib defaults.
 
+- **[Races/TOCTOU/FD agent] — well-hardened, no daemon mem-unsafety.** New (all low/info): race-1 CLI stdio double-close (`XPCMessage.swift:242-248` raw-closes then `ProcessIO.closeAfterStart` re-closes; client-side, CWE-415). race-2 guest-triggerable host fd leak (unconsumed vsock accepts dropped w/o close, `VsockListener.swift:84-91`; guest→host DoS). race-3 `fileHandles` fd1 leak on partial dup fail. race-4 `completeIngestSession` check-then-remove across await (idempotent under _lock, no substitution). **race-5 published-port 64-cap enforced CLIENT-side ONLY** (`Utility.swift:33,240-243`); server `RuntimeService.startSocketForwarders:894` re-checks only overlaps not count → same-EUID client bypasses cap (limit-bypass, informational). race-6 MAC-eviction mitigated by AsyncLock uniqueness.
+  - VERIFIED SAFE: BidirectionalRelay (once-close counter), VsockListener.finish idempotent, ContainersService/RuntimeService lifecycle under AsyncLock, SnapshotStore atomic move, DefaultNetworkService/AttachmentAllocator atomic alloc (no double-hand-out), AsyncLock correct, XPCServer per-msg tasks sound + EUID gate, server-side `set(FileHandle)` callers all pass dupHandle (single close), ArchiveReader fd handling.
+
 ## Blocked routes
 - **Guest→host gRPC/HTTP2 transport (escape crown-jewel):** HARDENED as configured; no OOB/unbounded-alloc/escape. Reopen only if container raises message limits or a dep default regresses.
+- **Daemon concurrency / fd-lifecycle:** hardened (AsyncLock, idempotent teardown, atomic allocators). No UAF/double-free/double-hand-out on the daemon side.
 - **Install/update scripts (root, `update-container.sh` root-reviewed):** HTTPS+GitHub download, macOS pkg signing, `mktemp -d`+`trap rm` (race-safe). Weak: opt-in UNSIGNED-pkg fallback (line 138-150) installs w/o signature — but gated by TLS + user prompt. Not a clean vuln. Low.
 - **Config/deserialization mass-assignment & YAML/plist/TOML parser crashes:** CLOSED (narrow image config; no YAML/plist decode; TOML decode trusted-only). Reopen only if a new attacker-reachable decoder appears.
 - **D (DNS parsing):** hardened; only unreachable latent bug. Reopen on new mechanism.
