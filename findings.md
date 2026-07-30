@@ -54,6 +54,7 @@ EXT4 export-path traps C1 (div-by-zero `inodesPerGroup==0`), C4/C5 (`subdata` ov
 - **Deserialization/mass-assignment**: no YAML/plist decode surface; OCI `ImageConfig` Codable is narrow (no rootfs/mounts/privileged/caps/host-path); registry JSON capped 4 MiB; swift-toml decode is trusted-only.
 - **Registry content-addressing** (non-pin): layers/config/manifests re-hashed before commit; no foreign-layer `urls` SSRF; push verifies returned digest.
 - **Netlink** (kernel-sourced, not guest), **cross-container network/IP allocation** (same-user), **virtiofs/kernel mount host paths** (user-config, not image/guest): not attacker-privilege-crossing.
+- **zstd C bridge** (`CArchive/archive_swift_bridge.c` `zstd_decompress_fd`): fixed zstd-recommended buffer sizes (not stream-driven), all malloc/`ZSTD_isError`/write checked, clean teardown → memory-safe; only the (already-captured M7) unbounded output. **libarchive tar/dir extraction** on host goes through the hardened `FileDescriptorOps` path.
 
 ## Top fixes (highest leverage)
 1. H1: compare resolved digest to the pinned digest (one guard).
