@@ -114,6 +114,16 @@ Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `app
 - TCP published-port forwarder + cross-container — running.
 - Race conditions / TOCTOU / FD lifecycle — launching.
 
+- **[TCP forwarder agent].** New findings:
+  - **★ T1 (HIGH, remote LAN): default `--publish` binds `0.0.0.0`, docs say loopback.** `Parser.swift:648-650` defaults hostAddress to `0.0.0.0` (sink `TCPForwarder.swift:66` bind); but `docs/how-to.md:153-162` ("forward from your loopback IP", 127.0.0.1 examples), `LocalNetworkPrivacy.swift:24-25` ("loopback interface"), `start-here.md:149` ("0.0.0.0 is safe … external systems have no access") all describe/promise loopback. ⇒ users expose guest dev-servers/DBs to unauth LAN peers. Security-posture bypass via misleading default. Fix: default `127.0.0.1`, opt-in `0.0.0.0`.
+  - **T2 (MEDIUM, remote LAN): `ConnectHandler` closes wrong channel on connect race** (`ConnectHandler.swift:62-67`: `context.channel.close()` should be `channel.close()`; log string confirms intent) → orphaned guest-bound backend channels leak fds → remote exhaustion toward `RLIMIT_NOFILE=65536`. One-line fix.
+  - T3 no connection cap / idle timeout (remote resource exhaustion, med-low). T4 half-close dead code (allowRemoteHalfClosure unset; inert, low). T5 SO_REUSEADDR cross-container port interplay (same-EUID, low).
+  - CLEARED SAFE: no SSRF (backend fixed to guest vmnet IP, no client-byte steering), `autoRead=false` until glued, no remotely-reachable crash on TCP path (no force-unwrap/try!/precondition), GlueHandler no UAF/leak, port-range overflow prevented, per-container ELG isolation, LRU is UDP-only.
+
+## Round 3 status
+- ✅ config/deserialization (F8 + negatives), ✅ builder (F2 reinforced), ✅ TCP forwarder (T1/T2).
+- ⏳ gRPC/HTTP2 transport (escape crown-jewel), ⏳ races/TOCTOU/FD-lifecycle.
+
 ## Blocked routes
 - **Config/deserialization mass-assignment & YAML/plist/TOML parser crashes:** CLOSED (narrow image config; no YAML/plist decode; TOML decode trusted-only). Reopen only if a new attacker-reachable decoder appears.
 - **D (DNS parsing):** hardened; only unreachable latent bug. Reopen on new mechanism.
