@@ -100,7 +100,22 @@ Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `app
 6. **A1-5 integer-trap crashes (MEDIUM, same-EUID DoS)**; F4 pull infinite loop; F6/B2 decompression bomb.
 7. **F7+ Registry credential exposure (MEDIUM, root-verified).** `RegistryClient.request` (`RegistryClient.swift:159-168`) attaches `authentication.token()` (Basic = `Authorization: Basic base64(user:pass)`) **preemptively & unconditionally to every request** — the first request AND the token request to the attacker-controlled `WWW-Authenticate` realm (`fetchToken`→`requestJSON(headers:[])`, `RegistryClient+Token.swift:138-158`; `createTokenRequest` does NOT validate realm host/scheme). With plaintext-by-default for private/internal registries (see F1(b)), a **LAN on-path attacker passively captures stored registry credentials** on the first plaintext request (no realm trick needed); the unvalidated realm additionally allows exfiltration to an attacker-chosen host. Requires the user to have `login`-stored creds for the (private) registry. Same plaintext-default root cause as F1.
 
+- **[Config/deserialization agent].** New: **F8 exponential pull-graph expansion (HIGH remote DoS)** — `getSupportedPlatforms` (`deps/.../ImageStore+Import.swift:230-254`) `toProcess = children` (line 251) has NO dedup/visited/depth cap (sibling `import` loop dedups at line 63); malicious registry serves nested indexes w/ N repeated children (mediaType attacker-set, `walk` recurses on it; `filterPlatforms` keeps platform-less index descriptors) → N·N²·N³ Descriptors → daemon OOM/hang; ~MB payload → ~10^12 allocs. Distinct from F4 (self-cycle loop). Inspection-only (no runtime PoC).
+  - Negatives (routes CLOSED): **no YAML decode** (Yams encode-only), **no plist decode**, swift-toml decode only on root-owned plugin config, swift-toml C++ bridge malloc can't overflow. **OCI `ImageConfig` Codable is narrow** (`ImageConfig.swift:22-66`: user/env/entrypoint/cmd/workingDir/labels/stopSignal only — no rootfs/mounts/privileged/caps/host-path) → **NO mass-assignment** of host-affecting fields; registry JSON capped 4MiB (no single-blob alloc DoS). F2-secondary: Double→UInt64 traps same-EUID (=A4).
+
+- **[Builder/BuildKit agent].** Host is gRPC CLIENT dialing buildkit container (vsock 8088); build pipeline runs in user's CLI process (same-UID). Key results:
+  - **Reinforces F2 (central):** unvalidated digest → `LocalContentStore.get` traversal ALSO reachable via build content-proxy (`BuildRemoteContentProxy.swift:66,82-85` → XPC `contentGet` → `ContentServiceHarness.swift:34-48` → same sink). Potential arbitrary host file read baked into built image (medium conf — depends whether shim/containerd canonicalizes digest upstream). ⇒ F2 is reachable from pull/load/XPC/build ⇒ fix centrally in `LocalContentStore.get`.
+  - Minor: Globber `**` unbounded recursion on in-context dir-symlink cycle (`Globber.swift:58-68`, no visited/depth guard) → client-side build crash/hang (self-inflicted DoS). Low.
+  - Residual: builder virtiofs export mount is RW host dir into builder VM (uid0, capAdd ALL) → disk exhaustion; no builder-controlled host-write-path traversal (proto `destination` never consumed by host write).
+  - CLEARED SAFE: FSSync containment (`resolvingSymlinksInPath`+`parentOf`), context symlinks stored literal (not dereferenced on host), NO host command exec from Dockerfile/build-arg, out.tar extraction hardened (FileDescriptorOps + `rejectedMembers.isEmpty`), export dest user-controlled not attacker, gRPC int fields failable (no traps).
+
+## Round 3 (launched)
+- gRPC/HTTP2 transport guest→host memory-safety (ESCAPE crown-jewel; cloned grpc-swift-2/nio-transport/nio-http2/nio) — running.
+- TCP published-port forwarder + cross-container — running.
+- Race conditions / TOCTOU / FD lifecycle — launching.
+
 ## Blocked routes
+- **Config/deserialization mass-assignment & YAML/plist/TOML parser crashes:** CLOSED (narrow image config; no YAML/plist decode; TOML decode trusted-only). Reopen only if a new attacker-reachable decoder appears.
 - **D (DNS parsing):** hardened; only unreachable latent bug. Reopen on new mechanism.
 - **Archive tar-slip / symlink extraction (host fs):** `extractContents` hardened. Reopen only if a *different* extractor (not FileDescriptorOps-based) writes untrusted archives to host fs.
 - **XPC EUID boundary:** no route crosses EUID/reaches root (agent A + recon). All services per-user launchd `gui/<uid>`.
