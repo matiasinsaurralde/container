@@ -124,7 +124,10 @@ Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `app
 - ✅ config/deserialization (F8 + negatives), ✅ builder (F2 reinforced), ✅ TCP forwarder (T1/T2).
 - ⏳ gRPC/HTTP2 transport (escape crown-jewel), ⏳ races/TOCTOU/FD-lifecycle.
 
+- **[gRPC/HTTP2 transport agent] — HARDENED, escape route CLOSED.** Host gRPC-client receive path from guest fully bounded: msg cap 4 MiB (`WrappedChannel.swift:312/325` → `GRPCMessageDecoder.swift:64` before `readSlice`), frame 16 KiB (`HTTP2FrameParser.swift:91`), header-list 16 KiB, CONTINUATION ≤5 (CVE-2024-27316 class mitigated, `:663`), HPACK varint overflow-hardened (`IntegerCoding.swift:115-131`), HPACK string len ≤ readableBytes (`HPACKDecoder.swift:291-293`), compression DISABLED (`enabledAlgorithms:.none`) + inflate capped 4 MiB. NIO `readSlice`/`readInteger` nil-safe (no OOB). containerization glue (`Vminitd.swift:36-56`) has no custom length-prefix handling; copy/stdio data-plane uses fixed host chunkSize, guest `totalSize` never drives alloc. **No memory-corruption escape.** Informational: `WrappedChannel` ignores `maxResponseMessageBytes` (uses request cap); container relies on lib defaults.
+
 ## Blocked routes
+- **Guest→host gRPC/HTTP2 transport (escape crown-jewel):** HARDENED as configured; no OOB/unbounded-alloc/escape. Reopen only if container raises message limits or a dep default regresses.
 - **Install/update scripts (root, `update-container.sh` root-reviewed):** HTTPS+GitHub download, macOS pkg signing, `mktemp -d`+`trap rm` (race-safe). Weak: opt-in UNSIGNED-pkg fallback (line 138-150) installs w/o signature — but gated by TLS + user prompt. Not a clean vuln. Low.
 - **Config/deserialization mass-assignment & YAML/plist/TOML parser crashes:** CLOSED (narrow image config; no YAML/plist decode; TOML decode trusted-only). Reopen only if a new attacker-reachable decoder appears.
 - **D (DNS parsing):** hardened; only unreachable latent bug. Reopen on new mechanism.
