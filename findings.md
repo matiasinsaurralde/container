@@ -125,6 +125,7 @@ Target: Apple `container` (macOS Linux-container runtime, Swift). Main dep: `app
 - ⏳ gRPC/HTTP2 transport (escape crown-jewel), ⏳ races/TOCTOU/FD-lifecycle.
 
 ## Blocked routes
+- **Install/update scripts (root, `update-container.sh` root-reviewed):** HTTPS+GitHub download, macOS pkg signing, `mktemp -d`+`trap rm` (race-safe). Weak: opt-in UNSIGNED-pkg fallback (line 138-150) installs w/o signature — but gated by TLS + user prompt. Not a clean vuln. Low.
 - **Config/deserialization mass-assignment & YAML/plist/TOML parser crashes:** CLOSED (narrow image config; no YAML/plist decode; TOML decode trusted-only). Reopen only if a new attacker-reachable decoder appears.
 - **D (DNS parsing):** hardened; only unreachable latent bug. Reopen on new mechanism.
 - **Archive tar-slip / symlink extraction (host fs):** `extractContents` hardened. Reopen only if a *different* extractor (not FileDescriptorOps-based) writes untrusted archives to host fs.
